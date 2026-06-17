@@ -18,6 +18,8 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
 
 
@@ -92,10 +94,122 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 1–2: parse the query into search parameters.
+    session["parsed"] = _parse_query(query)
+    parsed = session["parsed"]
+
+    # Guard: an empty wardrobe can't be styled — exit before searching.
+    if not wardrobe or not wardrobe.get("items"):
+        session["error"] = (
+            "Your wardrobe is empty. Add a few pieces you own so FitFindr can "
+            "style the find with them."
+        )
+        return session
+
+    # Step 3: search for listings, loosening the filters if nothing matches.
+    results = _search_with_loosening(parsed, session)
+    session["search_results"] = results
+    if not results:
+        session["error"] = (
+            f"No second-hand listings matched '{parsed['description']}'. "
+            "Try a different item or loosen your size/price."
+        )
+        return session
+
+    # Step 4: select the top (most relevant) result.
+    session["selected_item"] = results[0]
+
+    # Step 5: suggest an outfit pairing the find with the user's wardrobe.
+    outfit = suggest_outfit(session["selected_item"], wardrobe)
+    if not outfit or not outfit.strip():
+        session["error"] = "Could not generate an outfit suggestion for this item."
+        return session
+    session["outfit_suggestion"] = outfit
+
+    # Step 6: build the shareable fit card.
+    session["fit_card"] = create_fit_card(outfit, session["selected_item"])
+
+    # Step 7: return the completed session.
     return session
+
+
+# ── query parsing ──────────────────────────────────────────────────────────────
+
+# "M", "S/M", "XL", waist/length sizes like "W30" or "W30 L30", and US shoe sizes.
+_SIZE_RE = re.compile(
+    r"\bsize\s+([a-z0-9/]+(?:\s+\d+(?:\.\d)?)?)\b"
+    r"|\b(x{0,2}[sl]|m|l/xl|s/m|m/l)\b"
+    r"|\b(w\d{2}(?:\s*l\d{2})?)\b"
+    r"|\b(us\s*\d+(?:\.\d)?)\b",
+    re.IGNORECASE,
+)
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract a description, optional size, and optional max_price from the query.
+
+    Uses regex (no LLM call) so parsing is deterministic and cheap. The size and
+    price phrases are stripped from the text that becomes the search description.
+    """
+    size = None
+    max_price = None
+    description = query
+
+    # Price: look for an explicit ceiling phrase ("under $30", "below 25").
+    price_match = re.search(
+        r"(?:under|below|less than|max|up to|<)\s*\$?\s*(\d+(?:\.\d{1,2})?)",
+        query,
+        re.IGNORECASE,
+    )
+    if price_match:
+        max_price = float(price_match.group(1))
+        description = description.replace(price_match.group(0), " ")
+
+    # Size: prefer an explicit "size X" phrase, else a standalone size token.
+    size_match = _SIZE_RE.search(query)
+    if size_match:
+        size = next(g for g in size_match.groups() if g).strip()
+        description = description.replace(size_match.group(0), " ")
+
+    # Clean leftover punctuation/whitespace from the description.
+    description = re.sub(r"\s+", " ", description).strip(" ,.-")
+
+    return {"description": description, "size": size, "max_price": max_price}
+
+
+def _search_with_loosening(parsed: dict, session: dict) -> list:
+    """
+    Run search_listings, progressively loosening filters when nothing matches.
+
+    Tries the full query first, then drops the size filter, then raises the
+    price ceiling in $10 steps. Records any loosening in session["loosened"]
+    so the agent can mention it to the user.
+    """
+    session["loosened"] = []
+
+    results = search_listings(**parsed)
+    if results:
+        return results
+
+    # Drop the size filter.
+    if parsed.get("size") is not None:
+        results = search_listings(parsed["description"], None, parsed.get("max_price"))
+        if results:
+            session["loosened"].append(f"ignored size {parsed['size']}")
+            return results
+
+    # Raise the price ceiling up to $30 over the original.
+    if parsed.get("max_price") is not None:
+        for bump in (10, 20, 30):
+            raised = parsed["max_price"] + bump
+            results = search_listings(parsed["description"], None, raised)
+            if results:
+                session["loosened"].append(f"raised max price to ${raised:.0f}")
+                return results
+
+    return []
 
 
 # ── CLI test ──────────────────────────────────────────────────────────────────
